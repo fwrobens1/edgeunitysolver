@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.1.0
+// @version      1.2.0
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -45,6 +45,7 @@
     key: "",
     sniff: true,
     pos: null,
+    open: true,
     tab: "solve",
   };
 
@@ -739,21 +740,27 @@
     "*{box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}",
     ".wrap{position:fixed;z-index:2147483647;right:14px;bottom:14px;width:340px;max-height:70vh;",
     "background:#0d0f0e;color:#cfe8d8;border:1px solid #2a3a31;border-radius:10px;",
-    "box-shadow:0 10px 30px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden;font-size:12px}",
-    ".wrap.min{width:auto;max-height:none}",
-    ".bar{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#121815;cursor:pointer;",
-    "touch-action:none;user-select:none;border-bottom:1px solid #222d27}",
-    ".dot{width:8px;height:8px;border-radius:50%;background:#3ad17f}",
-    ".name{flex:1;font-weight:600;letter-spacing:.02em}",
+    "box-shadow:0 10px 30px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden;font-size:12px;",
+    "transition:transform .18s ease, opacity .18s ease}",
+    ".wrap.dragging{transition:none}",
+    ".wrap.hidden{display:none}",
+    ".bar{position:relative;display:flex;align-items:center;gap:8px;padding:8px 10px;background:#121815;cursor:grab;",
+    "touch-action:none;user-select:none;-webkit-user-select:none;border-bottom:1px solid #222d27}",
+    ".bar:active{cursor:grabbing}",
+    ".grab{position:absolute;left:50%;top:4px;width:34px;height:4px;margin-left:-17px;border-radius:2px;",
+    "background:#2f4738;display:none}",
+    ".dot{width:8px;height:8px;border-radius:50%;background:#3ad17f;flex:0 0 auto}",
+    ".name{flex:1;font-weight:600;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
     ".btn{background:#18231d;color:#cfe8d8;border:1px solid #2d4036;border-radius:6px;",
-    "padding:8px 10px;font-size:12px;cursor:pointer;min-height:36px}",
+    "padding:8px 10px;font-size:12px;cursor:pointer;min-height:36px;-webkit-tap-highlight-color:transparent}",
     ".btn:active{background:#22332a}",
     ".btn.go{background:#1c4a33;border-color:#2f7a52;color:#d6ffe9}",
     ".btn.off{opacity:.55}",
+    ".icon{min-height:28px;padding:2px 9px;font-size:15px;line-height:1;flex:0 0 auto}",
     ".tabs{display:flex;border-bottom:1px solid #222d27}",
-    ".tab{flex:1;text-align:center;padding:9px 4px;cursor:pointer;color:#7fa08e}",
+    ".tab{flex:1;text-align:center;padding:11px 4px;cursor:pointer;color:#7fa08e;-webkit-tap-highlight-color:transparent}",
     ".tab.on{color:#cfe8d8;box-shadow:inset 0 -2px 0 #3ad17f}",
-    ".body{padding:10px;overflow:auto}",
+    ".body{padding:10px;overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}",
     ".row{display:flex;gap:8px;margin-bottom:8px;align-items:center}",
     ".row .btn{flex:1}",
     ".kv{display:flex;justify-content:space-between;padding:3px 0;color:#8fb3a0}",
@@ -762,11 +769,24 @@
     "margin:8px 0;max-height:90px;overflow:auto;line-height:1.4;color:#a9c4b4}",
     "label.f{display:block;margin:8px 0 3px;color:#8fb3a0}",
     "input.t,textarea.t{width:100%;background:#0a100d;border:1px solid #26382f;border-radius:6px;",
-    "color:#d6efe1;padding:9px;font-size:13px}",
+    "color:#d6efe1;padding:9px;font-size:16px}",
     "textarea.t{min-height:80px;resize:vertical}",
     ".log{white-space:pre-wrap;line-height:1.45;color:#9db8a9;max-height:40vh;overflow:auto}",
-    "@media (max-width:640px){.wrap{right:0;left:0;bottom:0;width:100%;max-height:58vh;border-radius:12px 12px 0 0}",
-    ".btn{min-height:44px;padding:11px 12px;font-size:13px}}",
+    ".fab{position:fixed;z-index:2147483647;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));",
+    "width:52px;height:52px;border-radius:26px;border:1px solid #2f7a52;background:#163a28;color:#d6ffe9;",
+    "font:600 11px ui-monospace,monospace;letter-spacing:.04em;display:none;align-items:center;justify-content:center;",
+    "box-shadow:0 8px 24px rgba(0,0,0,.55);cursor:pointer;-webkit-tap-highlight-color:transparent}",
+    ".fab.show{display:flex}",
+    ".fab:active{background:#1c4a33}",
+    "@media (max-width:640px){",
+    ".wrap{right:0;left:0;bottom:0;width:100%;max-height:58vh;border-radius:14px 14px 0 0;",
+    "border-bottom:0;padding-bottom:env(safe-area-inset-bottom)}",
+    ".bar{padding:14px 12px 10px}",
+    ".grab{display:block}",
+    ".btn{min-height:44px;padding:11px 12px;font-size:13px}",
+    ".tab{padding:13px 4px;font-size:13px}",
+    ".fab{right:16px;bottom:calc(96px + env(safe-area-inset-bottom));width:56px;height:56px;border-radius:28px}",
+    "}",
   ].join("");
 
   function mkBtn(label, onClick, cls) {
@@ -787,9 +807,47 @@
 
     const dot = h("span", { class: "dot" });
     const name = h("span", { class: "name" }, "answers " + (bankSize() ? "· " + bankSize() : ""));
-    const minBtn = h("button", { class: "btn", style: "padding:4px 8px;min-height:28px", type: "button" }, "_");
-    const bar = h("div", { class: "bar" }, dot, name, minBtn);
+    const hideBtn = h("button", { class: "btn icon", type: "button", title: "hide panel", onclick: () => setOpen(false) }, "–");
+    const bar = h("div", { class: "bar" }, h("span", { class: "grab" }), dot, name, hideBtn);
     wrap.appendChild(bar);
+
+    const fab = h("button", { class: "fab", type: "button", title: "answers", "aria-label": "open answers panel", onclick: () => setOpen(true) }, "ea");
+
+    const isMobile = () => window.matchMedia("(max-width: 640px)").matches;
+
+    function applyLayout() {
+      if (isMobile()) {
+        // the sheet is CSS-anchored to the bottom; stale drag coords are what pinned it to the top
+        wrap.style.left = "";
+        wrap.style.top = "";
+        wrap.style.right = "";
+        return;
+      }
+      if (!cfg.pos) {
+        for (const p of ["left", "top", "right", "bottom"]) wrap.style[p] = "";
+        return;
+      }
+      const r = wrap.getBoundingClientRect();
+      const w = r.width || 340;
+      const x = clamp(cfg.pos.x, 4, Math.max(4, innerWidth - w - 4));
+      const y = clamp(cfg.pos.y, 4, Math.max(4, innerHeight - 80));
+      cfg.pos = { x, y };
+      wrap.style.left = x + "px";
+      wrap.style.top = y + "px";
+      wrap.style.right = "auto";
+      wrap.style.bottom = "auto";
+    }
+
+    function setOpen(v) {
+      cfg.open = !!v;
+      saveCfg();
+      wrap.classList.toggle("hidden", !v);
+      fab.classList.toggle("show", !v);
+      if (v) {
+        wrap.style.transform = "";
+        requestAnimationFrame(applyLayout);
+      }
+    }
 
     const tabs = h("div", { class: "tabs" });
     const body = h("div", { class: "body" });
@@ -860,6 +918,15 @@
       sniffBtn.className = "btn " + (cfg.sniff ? "go" : "off");
     };
     cfgPane.appendChild(h("div", { class: "row", style: "margin-top:10px" }, spoofBtn, stealthBtn, sniffBtn));
+    cfgPane.appendChild(h("div", { class: "row" },
+      mkBtn("reset panel", () => {
+        cfg.pos = null;
+        wrap.style.cssText = "";
+        saveCfg();
+        applyLayout();
+        setOpen(true);
+        log("panel reset");
+      })));
     cfgPane.appendChild(h("label", { class: "f" }, "import answer bank (json: [{question, answer}])"));
     const importArea = h("textarea", { class: "t", placeholder: '[{"question":"2+2","answer":"4"}]' });
     cfgPane.appendChild(importArea);
@@ -895,46 +962,79 @@
       logBox.scrollTop = logBox.scrollHeight;
     };
 
-    // drag + minimise
+    // drag on desktop, swipe-down on mobile
     let drag = null;
+    let raf = 0;
+    const paint = () => {
+      raf = 0;
+      if (!drag) return;
+      if (drag.mobile) {
+        wrap.style.transform = "translateY(" + Math.max(0, drag.dy) + "px)";
+        return;
+      }
+      const left = clamp(drag.rect.left + drag.dx, 4, Math.max(4, innerWidth - drag.rect.width - 4));
+      const top = clamp(drag.rect.top + drag.dy, 4, Math.max(4, innerHeight - 80));
+      wrap.style.left = left + "px";
+      wrap.style.top = top + "px";
+      wrap.style.right = "auto";
+      wrap.style.bottom = "auto";
+    };
     bar.addEventListener("pointerdown", (e) => {
-      if (e.target === minBtn) return;
-      drag = { x: e.clientX, y: e.clientY, pos: cfg.pos };
-      bar.setPointerCapture(e.pointerId);
+      if (e.target === hideBtn) return;
+      drag = { x: e.clientX, y: e.clientY, dx: 0, dy: 0, moved: false, mobile: isMobile(), rect: wrap.getBoundingClientRect() };
+      try { bar.setPointerCapture(e.pointerId); } catch {}
     });
     bar.addEventListener("pointermove", (e) => {
       if (!drag) return;
-      const wrapEl = wrap;
-      const r = wrapEl.getBoundingClientRect();
-      const left = clamp(r.left + (e.clientX - drag.x), 4, innerWidth - r.width - 4);
-      const top = clamp(r.top + (e.clientY - drag.y), 4, innerHeight - 60);
-      wrapEl.style.left = left + "px"; wrapEl.style.top = top + "px";
-      wrapEl.style.right = "auto"; wrapEl.style.bottom = "auto";
+      drag.dx = e.clientX - drag.x;
+      drag.dy = e.clientY - drag.y;
+      if (!drag.moved && Math.abs(drag.dx) + Math.abs(drag.dy) > 6) {
+        drag.moved = true;
+        wrap.classList.add("dragging");
+      }
+      if (drag.moved && !raf) raf = requestAnimationFrame(paint);
     });
-    bar.addEventListener("pointerup", () => {
+    const endDrag = () => {
       if (!drag) return;
+      const d = drag;
       drag = null;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      wrap.classList.remove("dragging");
+      if (d.mobile) {
+        wrap.style.transform = "";
+        if (d.dy > 70) { setOpen(false); return; }
+        return;
+      }
+      if (!d.moved) return;
       const r = wrap.getBoundingClientRect();
-      cfg.pos = { x: r.left, y: r.top }; saveCfg();
-    });
-    minBtn.addEventListener("click", () => {
-      wrap.classList.toggle("min");
-      for (const el of [tabs, body]) el.style.display = wrap.classList.contains("min") ? "none" : "";
-    });
+      cfg.pos = { x: r.left, y: r.top };
+      saveCfg();
+      applyLayout();
+    };
+    bar.addEventListener("pointerup", endDrag);
+    bar.addEventListener("pointercancel", endDrag);
 
-    if (cfg.pos) {
-      wrap.style.left = cfg.pos.x + "px";
-      wrap.style.top = cfg.pos.y + "px";
-      wrap.style.right = "auto";
-      wrap.style.bottom = "auto";
+    // keep the sheet above the on-screen keyboard
+    if (window.visualViewport) {
+      const vv = window.visualViewport;
+      const fit = () => {
+        if (!isMobile()) { wrap.style.bottom = ""; return; }
+        const off = Math.max(0, innerHeight - vv.height - vv.offsetTop);
+        wrap.style.bottom = off ? off + "px" : "";
+      };
+      vv.addEventListener("resize", fit);
+      vv.addEventListener("scroll", fit);
     }
 
     root.appendChild(wrap);
+    root.appendChild(fab);
     ui.host = host;
 
     ui.renderSolve();
     ui.renderCfgButtons();
     setTab(cfg.tab || "solve");
+    setOpen(cfg.open !== false);
+    window.addEventListener("resize", applyLayout);
     log("panel mounted on " + location.hostname);
   }
   // endregion
