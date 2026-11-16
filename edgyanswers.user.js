@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.3.0
+// @version      1.3.1
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -280,6 +280,7 @@
   const MAYBE_ITEM = /learnosity|il-apps|\/api\/|lmsapi|item|question|assess|activity|task|guide|data\.cw|\/data\//i;
   let lastItem = null;
   let remoteItem = null;
+  let remoteRefs = "";
   const pendingVerdicts = [];
   const autoFilled = new Set();
   const sniffSeen = new Set();
@@ -695,15 +696,59 @@
   }
 
   function fillLocal() {
-    let list = [];
-    try { list = domScan(); } catch {}
-    if (list.length) { for (const it of list) fillOrFetch(it, 0); return; }
-    if (lastItem) { fillOrFetch(lastItem, 0); return; }
-    if (remoteItem) { fillOrFetch(remoteItem, 0); return; }
-    let kids = 0;
-    try { kids = window.frames.length; } catch {}
-    if (kids) busDown({ ea: "fill" });
-    else log("no question found — open the activity and let it load");
+    if (!IS_TOP) busUp({ ea: "refs?" });
+    const opened = expandToggles(3);
+    const run = () => {
+      let list = [];
+      try { list = domScan(); } catch {}
+      if (list.length) { for (const it of list) fillOrFetch(it, 0); return; }
+      if (lastItem) { fillOrFetch(lastItem, 0); return; }
+      if (remoteItem) { fillOrFetch(remoteItem, 0); return; }
+      let kids = 0;
+      try { kids = window.frames.length; } catch {}
+      if (kids) busDown({ ea: "fill" });
+      else log("no question found — open the activity and let it load");
+    };
+    // the toggle needs a tick to swap the text in before we read it
+    if (opened) setTimeout(run, 450); else run();
+  }
+
+  const MORE_RE = /^(read more|show more|see more|view more|more info|expand|show all|learn more)\b/i;
+
+  // "Read More >>" is a plain click target that hides the actual instructions
+  function expandToggles(max) {
+    let n = 0;
+    const els = document.querySelectorAll('a,button,[role="button"],summary,[onclick]');
+    for (const el of els) {
+      if (n >= (max || 3)) break;
+      if (!visible(el)) continue;
+      if (el.closest('[aria-hidden="true"]')) continue;
+      // raw text here: cleanText() strips these exact labels as noise
+      const t = String(el.innerText || el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      if (!t || t.length > 30 || !MORE_RE.test(t) || /less/i.test(t)) continue;
+      try { el.click(); n++; } catch {}
+    }
+    if (n) log("expanded " + n + " collapsed section(s)");
+    return n;
+  }
+
+  function pageContext(limit) {
+    const main = document.querySelector('main,[role="main"],[class*="activity"],[class*="content-area"],[class*="assignment"]') || document.body;
+    return cleanText(main.innerText || main.textContent || "").slice(0, limit || 2500);
+  }
+
+  // notes/transcript tabs are hidden panels, already in the DOM — read them without switching tabs
+  function referenceText(limit) {
+    const parts = [];
+    let total = 0;
+    for (const el of document.querySelectorAll('[role="tabpanel"],[class*="note"],[class*="transcript"],[class*="glossary"]')) {
+      const t = cleanText(el.textContent || "");
+      if (t.length < 60) continue;
+      parts.push(t);
+      total += t.length;
+      if (total > (limit || 1500)) break;
+    }
+    return cleanText(parts.join(" ")).slice(0, limit || 1500);
   }
 
   let domTimer = 0;
@@ -772,13 +817,19 @@
   function aiWrite(item) {
     if (!cfg.key) return Promise.reject(new Error("no api key set"));
     const words = clamp(Number(cfg.words) || 100, 40, 400);
+    const context = pageContext(2500);
+    const refs = (referenceText(1500) + " " + remoteRefs).trim().slice(0, 1500);
+    let user = "Task:\n" + String(item.stem).slice(0, 2000);
+    if (context && norm(context) !== norm(item.stem)) user += "\n\nPage instructions:\n" + context;
+    if (refs) user += "\n\nReference material from the page:\n" + refs;
+    user += "\n\nWrite about " + words + " words. Follow every instruction above (language, counts, format). Output only the text to submit.";
     const body = {
       model: cfg.model,
       temperature: 0.5,
       max_tokens: 900,
       messages: [
         { role: "system", content: "You do school coursework. Write exactly what the prompt asks for. Plain text only: no markdown, no quoting, no preamble, no explanation of what you are doing." },
-        { role: "user", content: "Task:\n" + String(item.stem).slice(0, 2000) + "\n\nWrite about " + words + " words. If the task names a language, write in that language. Output only the text to submit." },
+        { role: "user", content: user },
       ],
     };
     return req({
@@ -904,6 +955,10 @@
       if (m.ea === "item") { ui.items += m.n || 1; ui.last = m.stem || ""; if (ui.renderSolve) ui.renderSolve(); if (m.item) busDown({ ea: "last", item: m.item }); }
       if (m.ea === "verdict") { ui.learned++; if (ui.renderSolve) ui.renderSolve(); }
       if (m.ea === "log" && m.msg) log("frame: " + m.msg);
+      if (m.ea === "refs?") {
+        const t = referenceText(1200) || pageContext(1200);
+        if (t) busDown({ ea: "refs", text: t });
+      }
       if (m.ea === "fill") fillLocal();
     });
   } else {
@@ -917,6 +972,11 @@
         remoteItem = m.item;
         if (!m.relay) busDown(Object.assign({}, m, { relay: true }));
       }
+      if (m.ea === "refs" && m.text) {
+        remoteRefs = String(m.text).slice(0, 1500);
+        if (!m.relay) busDown(Object.assign({}, m, { relay: true }));
+      }
+      if (m.ea === "refs?") busUp({ ea: "refs?" });
       if (m.ea === "fill") fillLocal();
     });
   }
@@ -1251,7 +1311,7 @@
   }
 
   try {
-    W.__answers = { extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal };
+    W.__answers = { extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText };
   } catch {}
 
   log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)"));
