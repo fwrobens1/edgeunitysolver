@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.2.0
+// @version      1.3.0
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -44,6 +44,7 @@
     model: "deepseek-v4.1-flash-free",
     key: "",
     sniff: true,
+    words: 100,
     pos: null,
     open: true,
     tab: "solve",
@@ -276,8 +277,9 @@
   // region capture
   const ITEM_URL = /^https:\/\/(questions|items)\.learnosity\.com\/v\d{4}\.\d+\.LTS(\/|$)/;
   const VERDICT_URL = /questionresponses/i;
-  const MAYBE_ITEM = /learnosity|il-apps|\/api\/|lmsapi|item|question|assess|activity|task/i;
+  const MAYBE_ITEM = /learnosity|il-apps|\/api\/|lmsapi|item|question|assess|activity|task|guide|data\.cw|\/data\//i;
   let lastItem = null;
+  let remoteItem = null;
   const pendingVerdicts = [];
   const autoFilled = new Set();
   const sniffSeen = new Set();
@@ -327,8 +329,8 @@
       lastItem = it;
     }
     log("item captured: " + items.length + " · " + hostPath(url) + " · " + items[0].stem.slice(0, 60));
-    busUp({ ea: "item", n: items.length, stem: items[0].stem.slice(0, 90) });
-    if (cfg.auto) autoFill(items[0]);
+    busUp({ ea: "item", n: items.length, stem: items[0].stem.slice(0, 90), item: items[items.length - 1] });
+    if (cfg.auto) for (const it of items) autoFill(it);
   }
 
   function onItemResponse(url, text) {
@@ -483,14 +485,25 @@
     } catch { try { n.click(); } catch {} }
   }
 
+  function setEditable(el, val) {
+    el.focus();
+    try {
+      const sel = window.getSelection && window.getSelection();
+      if (sel) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        if (document.execCommand && document.execCommand("insertText", false, val)) return;
+      }
+    } catch {}
+    el.textContent = val;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("blur", { bubbles: true }));
+  }
+
   function setFieldValue(el, val) {
-    if (el.isContentEditable) {
-      el.focus();
-      el.textContent = val;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("blur", { bubbles: true }));
-      return;
-    }
+    if (el.isContentEditable) { setEditable(el, val); return; }
     const proto = el instanceof W.HTMLTextAreaElement ? W.HTMLTextAreaElement.prototype
       : el instanceof W.HTMLInputElement ? W.HTMLInputElement.prototype
       : W.HTMLElement.prototype;
@@ -506,6 +519,16 @@
   function textFields() {
     const sel = 'textarea,input[type="text"],input:not([type]),[contenteditable="true"],[contenteditable=""]';
     return [...document.querySelectorAll(sel)].filter(visible);
+  }
+
+  // the writing box on edgenuity is a rich editor, not a plain input
+  function openFields() {
+    const sel = 'textarea,[contenteditable="true"],[contenteditable=""],[role="textbox"]';
+    return [...document.querySelectorAll(sel)].filter((el) => visible(el) && !el.closest('[aria-hidden="true"]'));
+  }
+
+  function fieldArea(el) {
+    try { const r = el.getBoundingClientRect(); return r.width * r.height; } catch { return 0; }
   }
 
   function applyAnswer(item, ans) {
@@ -525,7 +548,8 @@
       return hit > 0;
     }
     if (ans.text) {
-      const fields = textFields();
+      const open = openFields().sort((a, b) => fieldArea(b) - fieldArea(a));
+      const fields = open.length ? open : textFields();
       if (!fields.length) return false;
       setFieldValue(fields[0], ans.text);
       log("filled text answer");
@@ -538,6 +562,19 @@
     if (!item) return;
     const cached = bankGet(item);
     if (cached) { applyAnswer(item, cached); return; }
+    const open = !item.options || item.options.length === 0;
+    if (open) {
+      if (!cfg.ai) { log("open response — turn on use ai to write it"); return; }
+      const t0 = Date.now();
+      log("writing for: " + item.stem.slice(0, 44));
+      aiWrite(item).then((text) => {
+        const ok = applyAnswer(item, { text });
+        if (!ok) { log("wrote it but found no box to put it in"); return; }
+        bankPut(item, { text });
+        log("wrote " + text.split(/\s+/).filter(Boolean).length + " words in " + (Date.now() - t0) + "ms");
+      }).catch((e) => log("ai write failed: " + e.message));
+      return;
+    }
     if (cfg.ai) aiAnswer(item).then((ans) => {
       if (ans) { applyAnswer(item, ans); bankPut(item, ans); }
     }).catch((e) => log("ai: " + e.message));
@@ -545,6 +582,141 @@
       brainlyAnswer(item).then((ans) => { if (ans) { applyAnswer(item, ans); bankPut(item, ans); } }).catch(() => {});
     }
   }
+  // endregion
+
+  // region dom capture
+  // the item payload often lands before the hook exists, and open-response activities never
+  // send one at all, so the visible question is the source of truth when the net is quiet.
+  const UI_NOISE = /^(read more|show more|show less|hide|expand|collapse|prompt|next|previous|back|submit|save|save and exit|check answer|try again|skip)[\s»>…]*$/i;
+  const domKeys = new Set();
+
+  function cleanText(s) {
+    return String(s || "")
+      .replace(/\u00a0/g, " ")
+      .split(/\n+/)
+      .map((l) => l.replace(/\s+/g, " ").trim())
+      .filter((l) => l && !UI_NOISE.test(l))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function promptFor(el) {
+    let cur = el;
+    for (let d = 0; d < 9 && cur; d++) {
+      cur = cur.parentElement;
+      if (!cur) break;
+      const parts = [];
+      for (const sib of cur.children) {
+        if (sib === el || sib.contains(el)) continue;
+        if (sib.querySelector("textarea,[contenteditable=true],[role=radio],input")) continue;
+        const t = cleanText(sib.innerText || sib.textContent || "");
+        if (t.length > 3 && t.length < 1500) parts.push(t);
+      }
+      const joined = cleanText(parts.join(" "));
+      if (joined.length >= 15) return joined.slice(0, 1500);
+    }
+    return "";
+  }
+
+  function radioGroup(node) {
+    const g = node.closest('[role="radiogroup"],fieldset');
+    if (g) return g;
+    const name = node.getAttribute("name");
+    if (!name) return node.parentElement;
+    let cur = node.parentElement;
+    for (let d = 0; d < 6 && cur; d++) {
+      const same = cur.querySelectorAll('input[name="' + CSS.escape(name) + '"]');
+      if (same.length >= 2) return cur;
+      cur = cur.parentElement;
+    }
+    return node.parentElement;
+  }
+
+  function domItems() {
+    const out = [];
+    const seen = new Set();
+    const groups = new Map();
+    for (const n of document.querySelectorAll('[role="radio"],[role="checkbox"],input[type="radio"],input[type="checkbox"]')) {
+      if (!visible(n)) continue;
+      const g = radioGroup(n);
+      if (!g) continue;
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(n);
+    }
+    for (const [g, nodes] of groups) {
+      if (nodes.length < 2) continue;
+      const options = [];
+      for (const n of nodes) {
+        const label = n.closest("label") || (n.id ? document.querySelector('label[for="' + CSS.escape(n.id) + '"]') : null);
+        const text = cleanText((label && label.innerText) || n.getAttribute("aria-label") || n.value || "");
+        if (text) options.push({ label: String(options.length), text });
+      }
+      if (options.length < 2) continue;
+      let stem = promptFor(g);
+      if (!stem) {
+        const anc = g.closest('[class*="question"],[class*="prompt"],[class*="item"],[class*="response"]');
+        if (anc) {
+          let t = cleanText(anc.innerText || "");
+          for (const o of options) t = cleanText(t.split(o.text).join(" "));
+          stem = t;
+        }
+      }
+      if (stem.length < 8) continue;
+      const k = "mcq|" + norm(stem);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({ ref: "", type: "mcq", stem, options: options.slice(0, 12) });
+    }
+    for (const f of openFields()) {
+      if (f.tagName === "TEXTAREA" && fieldArea(f) < 3000) continue;
+      const stem = promptFor(f);
+      if (stem.length < 12) continue;
+      const k = "open|" + norm(stem);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({ ref: "", type: "open", stem, options: [] });
+    }
+    return out;
+  }
+
+  function domScan() {
+    let list = [];
+    try { list = domItems(); } catch { return []; }
+    const fresh = [];
+    for (const it of list) {
+      const k = it.type + "|" + norm(it.stem);
+      if (domKeys.has(k)) continue;
+      domKeys.add(k);
+      fresh.push(it);
+    }
+    if (fresh.length) ingest(fresh, "dom://" + location.host);
+    return list;
+  }
+
+  function fillLocal() {
+    let list = [];
+    try { list = domScan(); } catch {}
+    if (list.length) { for (const it of list) fillOrFetch(it, 0); return; }
+    if (lastItem) { fillOrFetch(lastItem, 0); return; }
+    if (remoteItem) { fillOrFetch(remoteItem, 0); return; }
+    let kids = 0;
+    try { kids = window.frames.length; } catch {}
+    if (kids) busDown({ ea: "fill" });
+    else log("no question found — open the activity and let it load");
+  }
+
+  let domTimer = 0;
+  function kickDomScan() {
+    if (domTimer) return;
+    domTimer = setTimeout(() => { domTimer = 0; try { domScan(); } catch {} }, 500);
+  }
+  try {
+    if (typeof MutationObserver === "function" && (document.body || document.documentElement)) {
+      new MutationObserver(kickDomScan).observe(document.documentElement || document.body, { childList: true, subtree: true });
+    }
+    setInterval(() => { if (!document.hidden) { try { domScan(); } catch {} } }, 3000);
+  } catch {}
   // endregion
 
   // region ai
@@ -594,6 +766,35 @@
       }
       if (parsed.text) { log("ai text: " + String(parsed.text).slice(0, 40)); return { text: String(parsed.text) }; }
       throw new Error("model returned no answer");
+    });
+  }
+
+  function aiWrite(item) {
+    if (!cfg.key) return Promise.reject(new Error("no api key set"));
+    const words = clamp(Number(cfg.words) || 100, 40, 400);
+    const body = {
+      model: cfg.model,
+      temperature: 0.5,
+      max_tokens: 900,
+      messages: [
+        { role: "system", content: "You do school coursework. Write exactly what the prompt asks for. Plain text only: no markdown, no quoting, no preamble, no explanation of what you are doing." },
+        { role: "user", content: "Task:\n" + String(item.stem).slice(0, 2000) + "\n\nWrite about " + words + " words. If the task names a language, write in that language. Output only the text to submit." },
+      ],
+    };
+    return req({
+      method: "POST",
+      url: cfg.base.replace(/\/+$/, "") + "/chat/completions",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + cfg.key },
+      data: JSON.stringify(body),
+      timeout: 90000,
+    }).then((r) => {
+      if (r.status < 200 || r.status >= 300) throw new Error("http " + r.status + " " + r.text.slice(0, 100));
+      let data;
+      try { data = JSON.parse(r.text); } catch { throw new Error("bad response json"); }
+      const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+      const text = String(content || "").trim();
+      if (!text) throw new Error("model returned nothing");
+      return text;
     });
   }
 
@@ -700,9 +901,10 @@
     window.addEventListener("message", (e) => {
       const m = e.data;
       if (!m || typeof m !== "object" || !m.ea) return;
-      if (m.ea === "item") { ui.items += m.n || 1; ui.last = m.stem || ""; if (ui.renderSolve) ui.renderSolve(); }
+      if (m.ea === "item") { ui.items += m.n || 1; ui.last = m.stem || ""; if (ui.renderSolve) ui.renderSolve(); if (m.item) busDown({ ea: "last", item: m.item }); }
       if (m.ea === "verdict") { ui.learned++; if (ui.renderSolve) ui.renderSolve(); }
       if (m.ea === "log" && m.msg) log("frame: " + m.msg);
+      if (m.ea === "fill") fillLocal();
     });
   } else {
     window.addEventListener("message", (e) => {
@@ -711,10 +913,11 @@
       if ((m.ea === "item" || m.ea === "verdict") && !m.relay) {
         busUp(Object.assign({}, m, { relay: true }));
       }
-      if (m.ea === "fill") {
-        if (lastItem) fillOrFetch(lastItem, 0);
-        else busDown({ ea: "fill" });
+      if (m.ea === "last" && m.item && m.item.stem) {
+        remoteItem = m.item;
+        if (!m.relay) busDown(Object.assign({}, m, { relay: true }));
       }
+      if (m.ea === "fill") fillLocal();
     });
   }
   // endregion
@@ -880,11 +1083,8 @@
     pane.solve.appendChild(ui.solveEl);
     pane.solve.appendChild(h("div", { class: "row" },
       mkBtn("fill current", () => {
-        const msg = { ea: "fill" };
-        try { window.postMessage(msg, "*"); } catch {}
-        busDown(msg);
-        if (lastItem) fillOrFetch(lastItem, 0);
         log("fill broadcast");
+        fillLocal();
       }, "go")));
     const autoBtn = mkBtn("auto-fill", () => { cfg.auto = !cfg.auto; saveCfg(); ui.renderSolve(); });
     const aiBtn = mkBtn("use ai", () => { cfg.ai = !cfg.ai; saveCfg(); ui.renderSolve(); });
@@ -906,6 +1106,7 @@
     const cfgPane = pane.cfg;
     cfgPane.appendChild(f("api base (openai-compatible)", "base", { ph: "https://api.groq.com/openai/v1" }));
     cfgPane.appendChild(f("model", "model", { ph: "llama-3.3-70b-versatile" }));
+    cfgPane.appendChild(f("written answer length (words)", "words", { ph: "100" }));
     cfgPane.appendChild(f("api key", "key", { pass: true, ph: "stored locally, never sent anywhere but your base url" }));
     cfgPane.appendChild(h("div", { class: "row", style: "margin-top:8px" },
       mkBtn("test ai", () => { probeAi(); }, "go")));
@@ -1050,7 +1251,7 @@
   }
 
   try {
-    W.__answers = { extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi };
+    W.__answers = { extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal };
   } catch {}
 
   log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)"));
