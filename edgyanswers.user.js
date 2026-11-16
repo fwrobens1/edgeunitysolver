@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.3.1
+// @version      1.3.2
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -127,6 +127,46 @@
   const visible = (el) => {
     try { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; } catch { return false; }
   };
+
+  // the editors on edgenuity sit in same-origin iframes and shadow roots; document.querySelectorAll stops at both
+  let rootsCache = null, rootsAt = 0;
+  function roots() {
+    if (rootsCache && Date.now() - rootsAt < 800) return rootsCache;
+    const list = [document];
+    for (let i = 0; i < list.length && list.length < 24; i++) {
+      let els;
+      try { els = list[i].querySelectorAll("*"); } catch { continue; }
+      for (const el of els) {
+        try {
+          if (el.shadowRoot) list.push(el.shadowRoot);
+          if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
+            const d = el.contentDocument;
+            if (d) list.push(d);
+          }
+        } catch {}
+      }
+    }
+    rootsCache = list;
+    rootsAt = Date.now();
+    return list;
+  }
+
+  function qAll(sel, onlyVisible) {
+    const out = [];
+    let own = null;
+    try { own = ui && ui.host && ui.host.shadowRoot; } catch {}
+    for (const r of roots()) {
+      if (own && r === own) continue;
+      let hits;
+      try { hits = r.querySelectorAll(sel); } catch { continue; }
+      for (const el of hits) {
+        if (onlyVisible && !visible(el)) continue;
+        out.push(el);
+        if (out.length > 300) return out;
+      }
+    }
+    return out;
+  }
   // endregion
 
   // region net
@@ -468,8 +508,7 @@
   function optionNodes() {
     const sel = '[role="radio"],[role="checkbox"],input[type="radio"],input[type="checkbox"]';
     const nodes = [];
-    for (const n of document.querySelectorAll(sel)) {
-      if (!visible(n)) continue;
+    for (const n of qAll(sel, true)) {
       const box = n.closest('label,[role="radio"],[role="checkbox"],li') || n.parentElement || n;
       const text = box === n ? (n.value || n.getAttribute("aria-label") || "") : (box.innerText || n.value || "");
       nodes.push({ node: n, text: textOf(text) });
@@ -487,15 +526,16 @@
   }
 
   function setEditable(el, val) {
+    const doc = el.ownerDocument || document;
     el.focus();
     try {
-      const sel = window.getSelection && window.getSelection();
+      const sel = doc.getSelection && doc.getSelection();
       if (sel) {
-        const range = document.createRange();
+        const range = doc.createRange();
         range.selectNodeContents(el);
         sel.removeAllRanges();
         sel.addRange(range);
-        if (document.execCommand && document.execCommand("insertText", false, val)) return;
+        if (doc.execCommand && doc.execCommand("insertText", false, val)) return;
       }
     } catch {}
     el.textContent = val;
@@ -518,14 +558,14 @@
   }
 
   function textFields() {
-    const sel = 'textarea,input[type="text"],input:not([type]),[contenteditable="true"],[contenteditable=""]';
-    return [...document.querySelectorAll(sel)].filter(visible);
+    const sel = 'textarea,input[type="text"],input:not([type]),[contenteditable="true"],[contenteditable=""],[contenteditable]:not([contenteditable="false"])';
+    return qAll(sel, true);
   }
 
   // the writing box on edgenuity is a rich editor, not a plain input
   function openFields() {
-    const sel = 'textarea,[contenteditable="true"],[contenteditable=""],[role="textbox"]';
-    return [...document.querySelectorAll(sel)].filter((el) => visible(el) && !el.closest('[aria-hidden="true"]'));
+    const sel = 'textarea,[contenteditable="true"],[contenteditable=""],[contenteditable]:not([contenteditable="false"]),[role="textbox"]';
+    return qAll(sel, true).filter((el) => !el.closest('[aria-hidden="true"]'));
   }
 
   function fieldArea(el) {
@@ -620,6 +660,21 @@
     return "";
   }
 
+  function promptDeep(el) {
+    const local = promptFor(el);
+    if (local) return local;
+    let doc = el.ownerDocument;
+    for (let d = 0; d < 4 && doc && doc !== document; d++) {
+      let fe = null;
+      try { fe = doc.defaultView && doc.defaultView.frameElement; } catch {}
+      if (!fe) break;
+      const p = promptFor(fe);
+      if (p) return p;
+      doc = fe.ownerDocument;
+    }
+    return "";
+  }
+
   function radioGroup(node) {
     const g = node.closest('[role="radiogroup"],fieldset');
     if (g) return g;
@@ -638,8 +693,7 @@
     const out = [];
     const seen = new Set();
     const groups = new Map();
-    for (const n of document.querySelectorAll('[role="radio"],[role="checkbox"],input[type="radio"],input[type="checkbox"]')) {
-      if (!visible(n)) continue;
+    for (const n of qAll('[role="radio"],[role="checkbox"],input[type="radio"],input[type="checkbox"]', true)) {
       const g = radioGroup(n);
       if (!g) continue;
       if (!groups.has(g)) groups.set(g, []);
@@ -671,7 +725,7 @@
     }
     for (const f of openFields()) {
       if (f.tagName === "TEXTAREA" && fieldArea(f) < 3000) continue;
-      const stem = promptFor(f);
+      const stem = promptDeep(f);
       if (stem.length < 12) continue;
       const k = "open|" + norm(stem);
       if (seen.has(k)) continue;
@@ -704,10 +758,13 @@
       if (list.length) { for (const it of list) fillOrFetch(it, 0); return; }
       if (lastItem) { fillOrFetch(lastItem, 0); return; }
       if (remoteItem) { fillOrFetch(remoteItem, 0); return; }
+      let boxes = 0;
+      try { boxes = openFields().length; } catch {}
+      if (boxes) log(boxes + " writing box(es) found, no prompt read");
       let kids = 0;
       try { kids = window.frames.length; } catch {}
       if (kids) busDown({ ea: "fill" });
-      else log("no question found — open the activity and let it load");
+      else if (!boxes) log("no question found — open the activity and let it load");
     };
     // the toggle needs a tick to swap the text in before we read it
     if (opened) setTimeout(run, 450); else run();
