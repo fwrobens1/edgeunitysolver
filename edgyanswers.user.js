@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.4.5
+// @version      1.5.0
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -32,7 +32,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.5";
+  const VERSION = "1.5.0";
   const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   // in the tampermonkey sandbox window.top and window are different proxies, so comparing the
   // page realm (unsafeWindow) is what tells the truth about the top frame
@@ -57,6 +57,7 @@
     key: "",
     sniff: true,
     words: 100,
+    vision: true,
     autonext: false,
     pos: null,
     open: true,
@@ -628,7 +629,7 @@
       if (!cfg.ai) { log("open response — turn on use ai to write it"); return; }
       const t0 = Date.now();
       log("writing for: " + item.stem.slice(0, 44));
-      aiWrite(item).then((text) => {
+      picsFor(item).then((pics) => aiWrite(item, pics)).then((text) => {
         const ok = applyAnswer(item, { text });
         if (!ok) { log("wrote it but found no box to put it in"); return; }
         bankPut(item, { text });
@@ -636,7 +637,7 @@
       }).catch((e) => log("ai write failed: " + e.message));
       return;
     }
-    if (cfg.ai) aiAnswer(item).then((ans) => {
+    if (cfg.ai) picsFor(item).then((pics) => aiAnswer(item, false, pics)).then((ans) => {
       if (ans) { applyAnswer(item, ans); bankPut(item, ans); }
     }).catch((e) => log("ai: " + e.message));
     else if (cfg.brainly && depth === 0) {
@@ -650,6 +651,7 @@
   // send one at all, so the visible question is the source of truth when the net is quiet.
   const UI_NOISE = /^(read more|show more|show less|hide|expand|collapse|prompt|next|previous|back|submit|save|save and exit|check answer|try again|skip|please select the best answer from the choices provided|select the best answer from the choices provided|select the best answer|choose the best answer|mark this and return|show me|show answer|review|flag)[\s»>….:!]*$/i;
   const domKeys = new Set();
+  const groupEls = new Map(); // item key -> the element group, so the image scoper knows where to look
 
   function cleanText(s) {
     return String(s || "")
@@ -824,6 +826,7 @@
       const k = "mcq|" + norm(stem);
       if (seen.has(k)) continue;
       seen.add(k);
+      groupEls.set(k, g);
       out.push({ ref: "", type: "mcq", stem, options: options.slice(0, 12), answered: groupAnswered(nodes) });
     }
     for (const f of openFields()) {
@@ -833,6 +836,7 @@
       const k = "open|" + norm(stem);
       if (seen.has(k)) continue;
       seen.add(k);
+      groupEls.set(k, f);
       out.push({ ref: "", type: "open", stem, options: [], answered: fieldFilled(f) });
     }
     return out;
@@ -946,6 +950,150 @@
   } catch {}
   // endregion
 
+  // region vision
+  // diagrams and charts on these pages are <canvas> or <img>; there is no browser screenshot API
+  // in a userscript, so the image itself is lifted out of the DOM and sent as a data url
+  const IMG_MIN_W = 80, IMG_MIN_H = 60;
+
+  function b64FromBuffer(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+
+  function inlineImage(src) {
+    return new Promise((resolve) => {
+      if (/^data:image\//i.test(src)) return resolve(src);
+      if (typeof GM_xmlhttpRequest !== "function") return resolve("");
+      GM_xmlhttpRequest({
+        method: "GET", url: src, responseType: "arraybuffer", timeout: 12000,
+        onload: (r) => {
+          try {
+            if (r.status >= 400 || !r.response) return resolve("");
+            const b = new Uint8Array(r.response);
+            let mime = "image/png";
+            if (b[0] === 0xff && b[1] === 0xd8) mime = "image/jpeg";
+            else if (b[0] === 0x47 && b[1] === 0x49) mime = "image/gif";
+            else if (b[0] === 0x52 && b[1] === 0x49) mime = "image/webp";
+            resolve("data:" + mime + ";base64," + b64FromBuffer(r.response));
+          } catch { resolve(""); }
+        },
+        onerror: () => resolve(""),
+        ontimeout: () => resolve(""),
+      });
+    });
+  }
+
+  function shrinkDataUrl(url, max) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const k = Math.min(1, (max || 1100) / Math.max(img.width, img.height, 1));
+          if (k >= 1) return resolve(url);
+          const c = document.createElement("canvas");
+          c.width = Math.max(1, Math.round(img.width * k));
+          c.height = Math.max(1, Math.round(img.height * k));
+          c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+          resolve(c.toDataURL("image/png"));
+        } catch { resolve(url); }
+      };
+      img.onerror = () => resolve("");
+      img.src = url;
+    });
+  }
+
+  function imageScope(item) {
+    let el = null;
+    try { el = item && groupEls.get(itemKey(item)); } catch {}
+    if (!el) return null;
+    try {
+      return el.closest('[class*="question"],[class*="prompt"],[class*="item"],[class*="response"],[class*="stimulus"],[class*="passage"],[class*="media"],[class*="graph"]')
+        || el.parentElement || el;
+    } catch { return el.parentElement || el; }
+  }
+
+  function captureImages(item) {
+    const out = [];
+    const scope = imageScope(item);
+    if (!scope) return Promise.resolve(out);
+    const seen = new Set();
+    const nodes = [];
+    try { for (const el of qAll("canvas,img", true)) { if (scope.contains(el)) nodes.push(el); } } catch {}
+    return nodes.reduce((p, el) => p.then(async () => {
+      if (out.length >= 3) return;
+      try {
+        if (el.tagName === "CANVAS") {
+          if (el.width < IMG_MIN_W || el.height < IMG_MIN_H) return;
+          const u = await shrinkDataUrl(el.toDataURL("image/png"));
+          if (u) out.push(u);
+          return;
+        }
+        const r = el.getBoundingClientRect();
+        if (r.width < IMG_MIN_W || r.height < IMG_MIN_H) return;
+        const raw = el.currentSrc || el.src || "";
+        if (!raw || seen.has(raw)) return;
+        seen.add(raw);
+        let u = await inlineImage(raw);
+        if (!u) return;
+        u = await shrinkDataUrl(u);
+        if (u) out.push(u);
+      } catch {}
+    }), Promise.resolve()).then(() => out);
+  }
+
+  function picsFor(item) {
+    if (!cfg.vision) return Promise.resolve([]);
+    return captureImages(item).then((imgs) => {
+      if (imgs.length) log("vision: " + imgs.length + " image(s) attached");
+      return imgs;
+    }).catch(() => []);
+  }
+
+  function visionBody(promptText, images, maxTokens, temp, system) {
+    return {
+      model: cfg.model,
+      temperature: temp == null ? 0.2 : temp,
+      max_tokens: maxTokens || 300,
+      messages: [
+        { role: "system", content: system || "You answer school questions accurately. Read any image attached and use it." },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: promptText },
+            ...images.map((u) => ({ type: "image_url", image_url: { url: u } })),
+          ],
+        },
+      ],
+    };
+  }
+
+  function probeVision() {
+    if (!cfg.key) { log("vision test: no api key set"); return; }
+    const t0 = Date.now();
+    captureImages(lastItem || domItems()[0] || null).then((imgs) => {
+      if (!imgs.length) { log("vision test: no image found in the question area"); return; }
+      const kb = Math.round((imgs.reduce((a, u) => a + u.length, 0) * 0.75) / 1024);
+      log("vision test: " + imgs.length + " image(s), ~" + kb + "KB — asking the model");
+      const body = visionBody("Describe what is in this image in one short line. If it is a chart or table, read its numbers.", imgs, 80, 0);
+      return req({
+        method: "POST",
+        url: cfg.base.replace(/\/+$/, "") + "/chat/completions",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + cfg.key },
+        data: JSON.stringify(body),
+        timeout: 90000,
+      }).then((r) => {
+        if (r.status < 200 || r.status >= 300) { log("vision test failed: http " + r.status + " " + r.text.slice(0, 120)); return; }
+        let data;
+        try { data = JSON.parse(r.text); } catch { log("vision test failed: bad response json"); return; }
+        const out = String((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
+        log("vision test ok in " + (Date.now() - t0) + "ms: " + (out ? out.slice(0, 140) : "(empty reply)"));
+      });
+    }).catch((e) => log("vision test failed: " + e.message));
+  }
+  // endregion
+
   // region ai
   function aiPrompt(item) {
     const opts = item.options.map((o, i) => i + ". " + textOf(o.text)).join("\n");
@@ -995,26 +1143,30 @@
       "\n\nReply with only the number of the correct option.";
   }
 
-  function aiAnswer(item, retry) {
+  function aiAnswer(item, retry, images) {
     if (!cfg.key) return Promise.reject(new Error("no api key set"));
     const url = cfg.base.replace(/\/+$/, "") + "/chat/completions";
-    const body = retry ? {
-      model: cfg.model,
-      temperature: 0,
-      max_tokens: 20,
-      messages: [
-        { role: "system", content: "Reply with only the option number. Nothing else." },
-        { role: "user", content: aiPromptTerse(item) },
-      ],
-    } : {
-      model: cfg.model,
-      temperature: 0.2,
-      max_tokens: 300,
-      messages: [
-        { role: "system", content: "You answer exam questions accurately and return strict JSON." },
-        { role: "user", content: aiPrompt(item) },
-      ],
-    };
+    const pics = images || [];
+    const text = retry ? aiPromptTerse(item) : aiPrompt(item);
+    const body = pics.length
+      ? visionBody(text, pics, retry ? 20 : 300, retry ? 0 : 0.2, retry ? "Reply with only the option number. Nothing else." : null)
+      : (retry ? {
+        model: cfg.model,
+        temperature: 0,
+        max_tokens: 20,
+        messages: [
+          { role: "system", content: "Reply with only the option number. Nothing else." },
+          { role: "user", content: text },
+        ],
+      } : {
+        model: cfg.model,
+        temperature: 0.2,
+        max_tokens: 300,
+        messages: [
+          { role: "system", content: "You answer exam questions accurately and return strict JSON." },
+          { role: "user", content: text },
+        ],
+      });
     return req({
       method: "POST",
       url,
@@ -1022,7 +1174,13 @@
       data: JSON.stringify(body),
       timeout: 60000,
     }).then((r) => {
-      if (r.status < 200 || r.status >= 300) throw new Error("http " + r.status + " " + r.text.slice(0, 100));
+      if (r.status < 200 || r.status >= 300) {
+        if (pics.length) {
+          log("vision rejected (" + r.status + ") — answering from text only");
+          return aiAnswer(item, retry, []);
+        }
+        throw new Error("http " + r.status + " " + r.text.slice(0, 100));
+      }
       let data;
       try { data = JSON.parse(r.text); } catch { throw new Error("bad response json"); }
       const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
@@ -1052,7 +1210,7 @@
     });
   }
 
-  function aiWrite(item) {
+  function aiWrite(item, images) {
     if (!cfg.key) return Promise.reject(new Error("no api key set"));
     const words = clamp(Number(cfg.words) || 100, 40, 400);
     const context = pageContext(2500);
@@ -1061,15 +1219,19 @@
     if (context && norm(context) !== norm(item.stem)) user += "\n\nPage instructions:\n" + context;
     if (refs) user += "\n\nReference material from the page:\n" + refs;
     user += "\n\nWrite about " + words + " words. Follow every instruction above (language, counts, format). Output only the text to submit.";
-    const body = {
-      model: cfg.model,
-      temperature: 0.5,
-      max_tokens: 900,
-      messages: [
-        { role: "system", content: "You do school coursework. Write exactly what the prompt asks for. Plain text only: no markdown, no quoting, no preamble, no explanation of what you are doing." },
-        { role: "user", content: user },
-      ],
-    };
+    const pics = images || [];
+    const system = "You do school coursework. Write exactly what the prompt asks for. Plain text only: no markdown, no quoting, no preamble, no explanation of what you are doing.";
+    const body = pics.length
+      ? visionBody(user, pics, 900, 0.5, system)
+      : {
+        model: cfg.model,
+        temperature: 0.5,
+        max_tokens: 900,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+      };
     return req({
       method: "POST",
       url: cfg.base.replace(/\/+$/, "") + "/chat/completions",
@@ -1077,7 +1239,13 @@
       data: JSON.stringify(body),
       timeout: 90000,
     }).then((r) => {
-      if (r.status < 200 || r.status >= 300) throw new Error("http " + r.status + " " + r.text.slice(0, 100));
+      if (r.status < 200 || r.status >= 300) {
+        if (pics.length) {
+          log("vision rejected (" + r.status + ") — writing from text only");
+          return aiWrite(item, []);
+        }
+        throw new Error("http " + r.status + " " + r.text.slice(0, 100));
+      }
       let data;
       try { data = JSON.parse(r.text); } catch { throw new Error("bad response json"); }
       const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
@@ -1588,16 +1756,19 @@
     cfgPane.appendChild(f("written answer length (words)", "words", { ph: "100" }));
     cfgPane.appendChild(f("api key", "key", { pass: true, ph: "stored locally, never sent anywhere but your base url" }));
     cfgPane.appendChild(h("div", { class: "row", style: "margin-top:8px" },
-      mkBtn("test ai", () => { probeAi(); }, "go")));
+      mkBtn("test ai", () => { probeAi(); }, "go"),
+      mkBtn("test vision", () => { probeVision(); }, "go")));
     const spoofBtn = mkBtn("lockdown spoof", () => { cfg.spoof = !cfg.spoof; saveCfg(); ui.renderCfgButtons(); });
     const stealthBtn = mkBtn("stealth", () => { cfg.stealth = !cfg.stealth; saveCfg(); ui.renderCfgButtons(); });
     const sniffBtn = mkBtn("sniff net", () => { cfg.sniff = !cfg.sniff; saveCfg(); ui.renderCfgButtons(); });
+    const visBtn = mkBtn("read images", () => { cfg.vision = !cfg.vision; saveCfg(); ui.renderCfgButtons(); });
     ui.renderCfgButtons = () => {
       spoofBtn.className = "btn " + (cfg.spoof ? "go" : "off");
       stealthBtn.className = "btn " + (cfg.stealth ? "go" : "off");
       sniffBtn.className = "btn " + (cfg.sniff ? "go" : "off");
+      visBtn.className = "btn " + (cfg.vision ? "go" : "off");
     };
-    cfgPane.appendChild(h("div", { class: "row", style: "margin-top:10px" }, spoofBtn, stealthBtn, sniffBtn));
+    cfgPane.appendChild(h("div", { class: "row", style: "margin-top:10px" }, spoofBtn, stealthBtn, sniffBtn, visBtn));
     cfgPane.appendChild(h("div", { class: "row" },
       mkBtn("reset panel", () => {
         cfg.pos = null;
@@ -1755,7 +1926,7 @@
   }
 
   try {
-    W.__answers = { version: VERSION, extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, probeDom, parseAiJson, resolvePick, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
+    W.__answers = { version: VERSION, extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, probeVision, captureImages, picsFor, probeDom, parseAiJson, resolvePick, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
   } catch {}
 
   log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)") + " · v" + VERSION);
