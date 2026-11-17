@@ -32,7 +32,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.4";
+  const VERSION = "1.4.5";
   const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   // in the tampermonkey sandbox window.top and window are different proxies, so comparing the
   // page realm (unsafeWindow) is what tells the truth about the top frame
@@ -616,6 +616,11 @@
 
   function fillOrFetch(item, depth) {
     if (!item) return;
+    if (item.answered && item.options && item.options.length) {
+      // a selection is already sitting there — never flip it on a revisit
+      answered.set(itemKey(item), Date.now());
+      return;
+    }
     const cached = bankGet(item);
     if (cached) { applyAnswer(item, cached); return; }
     const open = !item.options || item.options.length === 0;
@@ -643,7 +648,7 @@
   // region dom capture
   // the item payload often lands before the hook exists, and open-response activities never
   // send one at all, so the visible question is the source of truth when the net is quiet.
-  const UI_NOISE = /^(read more|show more|show less|hide|expand|collapse|prompt|next|previous|back|submit|save|save and exit|check answer|try again|skip)[\s»>…]*$/i;
+  const UI_NOISE = /^(read more|show more|show less|hide|expand|collapse|prompt|next|previous|back|submit|save|save and exit|check answer|try again|skip|please select the best answer from the choices provided|select the best answer from the choices provided|select the best answer|choose the best answer|mark this and return|show me|show answer|review|flag)[\s»>….:!]*$/i;
   const domKeys = new Set();
 
   function cleanText(s) {
@@ -699,7 +704,8 @@
     try { box = n.closest('label,[role="radio"],[role="checkbox"],[role="option"],li'); } catch {}
     if (!box) box = n.parentElement || n;
     const raw = (box.innerText || "") || n.getAttribute("aria-label") || n.value || "";
-    return cleanText(raw);
+    // letters get reshuffled between attempts; the text is the only stable handle
+    return cleanText(raw).replace(/^[a-hA-H][.)]\s+/, "");
   }
 
   function radioGroup(node) {
@@ -949,16 +955,58 @@
   }
 
   function parseAiJson(text) {
-    const s = String(text || "").replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-    const m = s.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    try { return JSON.parse(m[0]); } catch { return null; }
+    let s = String(text || "").replace(/```[a-z]*|```/gi, "").trim();
+    const first = s.indexOf("{"), last = s.lastIndexOf("}");
+    if (first === -1 || last <= first) return null;
+    const slice = s.slice(first, last + 1);
+    try { return JSON.parse(slice); } catch {}
+    try { return JSON.parse(slice.replace(/,\s*([}\]])/g, "$1").replace(/'/g, '"')); } catch {}
+    return null;
   }
 
-  function aiAnswer(item) {
+  // the model answers with an index, a letter, or the option text itself, depending on the mood
+  function resolvePick(parsed, item) {
+    const raw = parsed.pick != null ? parsed.pick
+      : parsed.answer != null ? parsed.answer
+      : parsed.choice != null ? parsed.choice
+      : parsed.index;
+    if (raw == null) return -1;
+    if (typeof raw === "number" && item.options[raw]) return raw;
+    const s = String(raw).trim();
+    if (/^\d+$/.test(s) && item.options[Number(s)]) return Number(s);
+    const letter = s.match(/^([a-h])\s*[.):]?$/i);
+    if (letter) {
+      const i = letter[1].toLowerCase().charCodeAt(0) - 97;
+      if (item.options[i]) return i;
+    }
+    const want = norm(s);
+    if (want) {
+      let i = item.options.findIndex((o) => norm(o.text) === want);
+      if (i >= 0) return i;
+      i = item.options.findIndex((o) => norm(o.text).startsWith(want) || want.startsWith(norm(o.text)));
+      if (i >= 0) return i;
+    }
+    return -1;
+  }
+
+  function aiPromptTerse(item) {
+    const opts = item.options.map((o, i) => i + ". " + textOf(o.text)).join("\n");
+    return "Question:\n" + textOf(item.stem).slice(0, 1200) + "\n\nOptions:\n" + opts +
+      "\n\nReply with only the number of the correct option.";
+  }
+
+  function aiAnswer(item, retry) {
     if (!cfg.key) return Promise.reject(new Error("no api key set"));
     const url = cfg.base.replace(/\/+$/, "") + "/chat/completions";
-    const body = {
+    const body = retry ? {
+      model: cfg.model,
+      temperature: 0,
+      max_tokens: 20,
+      messages: [
+        { role: "system", content: "Reply with only the option number. Nothing else." },
+        { role: "user", content: aiPromptTerse(item) },
+      ],
+    } : {
       model: cfg.model,
       temperature: 0.2,
       max_tokens: 300,
@@ -978,15 +1026,29 @@
       let data;
       try { data = JSON.parse(r.text); } catch { throw new Error("bad response json"); }
       const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-      const parsed = parseAiJson(content);
-      if (!parsed) throw new Error("model returned no json");
-      if (parsed.pick != null && item.options[parsed.pick]) {
-        const o = item.options[parsed.pick];
-        log("ai pick " + parsed.pick + (parsed.why ? " (" + parsed.why + ")" : ""));
-        return { picks: [{ text: o.text }] };
+      if (retry) {
+        const n = parseInt(String(content || "").match(/-?\d+/)?.[0], 10);
+        if (Number.isInteger(n) && item.options[n]) {
+          log("ai pick " + n + " (plain)");
+          return { picks: [{ text: item.options[n].text }] };
+        }
+        throw new Error("model returned no answer");
       }
-      if (parsed.text) { log("ai text: " + String(parsed.text).slice(0, 40)); return { text: String(parsed.text) }; }
-      throw new Error("model returned no answer");
+      const parsed = parseAiJson(content);
+      if (parsed) {
+        const i = resolvePick(parsed, item);
+        if (i >= 0) {
+          log("ai pick " + i + (parsed.why ? " (" + parsed.why + ")" : ""));
+          return { picks: [{ text: item.options[i].text }] };
+        }
+        if (parsed.text && String(parsed.text).trim()) {
+          const t = String(parsed.text).trim();
+          const hit = item.options.findIndex((o) => norm(o.text) === norm(t));
+          if (hit >= 0) { log("ai pick " + hit + " (text)"); return { picks: [{ text: item.options[hit].text }] }; }
+        }
+      }
+      log("ai: no usable json, asking again for a bare number");
+      return aiAnswer(item, true);
     });
   }
 
@@ -1693,7 +1755,7 @@
   }
 
   try {
-    W.__answers = { version: VERSION, extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, probeDom, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
+    W.__answers = { version: VERSION, extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, probeDom, parseAiJson, resolvePick, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
   } catch {}
 
   log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)") + " · v" + VERSION);
