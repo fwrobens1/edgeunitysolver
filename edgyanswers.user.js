@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.4.2
+// @version      1.4.3
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -32,7 +32,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.2";
+  const VERSION = "1.4.3";
   const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   // in the tampermonkey sandbox window.top and window are different proxies, so comparing the
   // page realm (unsafeWindow) is what tells the truth about the top frame
@@ -519,6 +519,8 @@
 
   // region fill
   let lastFillAt = 0;
+  const answered = new Map(); // itemKey -> when the click landed, so advance can prove the page is done
+  const itemKey = (it) => it.type + "|" + norm(it.stem);
 
   function optionNodes() {
     const out = [];
@@ -595,7 +597,7 @@
           || nodes.find((x) => norm(x.text).includes(want) || want.includes(norm(x.text)));
         if (n) { clickNode(n.node); hit++; }
       }
-      if (hit) { lastFillAt = Date.now(); log("filled " + hit + " option(s)"); }
+      if (hit) { lastFillAt = Date.now(); answered.set(itemKey(item), Date.now()); log("filled " + hit + " option(s)"); }
       return hit > 0;
     }
     if (ans.text) {
@@ -604,6 +606,7 @@
       if (!fields.length) return false;
       setFieldValue(fields[0], ans.text);
       lastFillAt = Date.now();
+      answered.set(itemKey(item), Date.now());
       log("filled text answer");
       return true;
     }
@@ -1102,6 +1105,9 @@
   let advanceCount = 0;
   let lastClickText = "";
   let lastClickAt = 0;
+  let lastWarnAt = 0;
+  let lastWaitAt = 0;
+  const fillTry = new Map();
 
   function buttonText(el) {
     return String(el.innerText || el.value || el.textContent || el.getAttribute("aria-label") || el.title || "")
@@ -1131,6 +1137,42 @@
     return t;
   }
 
+  const UNANSWERED_WARN = /unanswered|not answered|incomplete|answer all|all questions|questions? remaining/i;
+
+  function modalText() {
+    let m = null;
+    try { m = document.querySelector('[role="dialog"],[role="alertdialog"],[class*="modal"],[class*="dialog"]'); } catch {}
+    return m ? cleanText(m.innerText || "") : "";
+  }
+
+  // findButton skips anything matching AVOID_RE, so the dialog's own Cancel needs its own path
+  function clickModalCancel() {
+    let m = null;
+    try { m = document.querySelector('[role="dialog"],[role="alertdialog"],[class*="modal"],[class*="dialog"]'); } catch {}
+    if (!m) return "";
+    for (const el of m.querySelectorAll('button,a,[role="button"],input[type="button"]')) {
+      const t = buttonText(el);
+      if (!/^(cancel|stay|no|go back|return|review|close)$/i.test(t)) continue;
+      try { el.click(); return t; } catch {}
+    }
+    return "";
+  }
+
+  // every question detected on this page must have had an answer applied before we move on
+  function pageState() {
+    let list = [];
+    try { list = domItems(); } catch {}
+    const seen = new Set();
+    const missing = [];
+    for (const it of list) {
+      const k = itemKey(it);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      if (!answered.has(k)) missing.push(it);
+    }
+    return { count: seen.size, missing, ready: seen.size > 0 && missing.length === 0 };
+  }
+
   function advanceTick(force) {
     if (!force && !cfg.autonext) return;
     if (Date.now() < advanceCooldown || (!force && advanceCount > 60)) return;
@@ -1138,19 +1180,60 @@
       // tell the shell whether this frame still has a step of its own to take
       if (findButton(ADVANCE_RE, false, true)) { lastStateAt = Date.now(); busUp({ ea: "state", can: true }); }
     }
-    if (Date.now() - lastAdvanceAt < 20000) {
-      const c = clickButton(CONFIRM_RE, true);
-      if (c) {
-        lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 1500; advanceCount++;
-        log("auto: " + c + " (dialog)");
+
+    const modal = modalText();
+    if (modal) {
+      if (UNANSWERED_WARN.test(modal)) {
+        if (Date.now() - lastWarnAt > 5000) {
+          lastWarnAt = Date.now();
+          const c = clickModalCancel();
+          log("dialog: \"" + modal.slice(0, 90) + "\" — " + (c ? "dismissed with " + c : "not confirming"));
+        }
         return;
       }
+      if (Date.now() - lastAdvanceAt < 20000) {
+        const c = clickButton(CONFIRM_RE, true);
+        if (c) {
+          lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 1500; advanceCount++;
+          log("auto: " + c + " (dialog)");
+        }
+      }
+      return; // a modal owns the page; never click through it
     }
-    const filledRecently = force || Date.now() - lastFillAt < 120000;
+
+    const st = pageState();
+    if (st.missing.length && !force) {
+      // autonext fills what it can, then waits — it never walks past an unanswered page
+      if (cfg.autonext) {
+        const now = Date.now();
+        for (const it of st.missing) {
+          const k = itemKey(it);
+          if (now - (fillTry.get(k) || 0) < 25000) continue;
+          fillTry.set(k, now);
+          fillOrFetch(it, 0);
+        }
+      }
+      if (Date.now() - lastWaitAt > 8000) {
+        lastWaitAt = Date.now();
+        log("holding: " + st.missing.length + "/" + st.count + " unanswered");
+      }
+      return;
+    }
+    if (!st.ready && !force) {
+      if (st.count) return; // questions here, not all answered yet
+      // nothing detectable: entering or continuing is safe, advancing is not
+      const e = clickButton(ENTER_RE, false);
+      if (e) {
+        lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 2500; advanceCount++;
+        log("auto: " + e);
+      }
+      return;
+    }
+
     const hasFrames = (() => { try { return window.frames.length > 0; } catch { return false; } })();
     const topGate = !force && IS_TOP && hasFrames &&
       (Date.now() - lastChildState < 8000 || Date.now() - lastChildAdv < 8000);
-    if (filledRecently && !topGate) {
+    if (!topGate) {
       const a = clickButton(ADVANCE_RE, false);
       if (a) {
         lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 2200; advanceCount++;
@@ -1159,10 +1242,12 @@
         return;
       }
     }
-    const e = clickButton(ENTER_RE, false);
-    if (e) {
-      lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 2500; advanceCount++;
-      log("auto: " + e);
+    if (!st.count) {
+      const e = clickButton(ENTER_RE, false);
+      if (e) {
+        lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 2500; advanceCount++;
+        log("auto: " + e);
+      }
     }
   }
 
