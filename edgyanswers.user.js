@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.4.1
+// @version      1.4.2
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -32,7 +32,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.1";
+  const VERSION = "1.4.2";
   const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   // in the tampermonkey sandbox window.top and window are different proxies, so comparing the
   // page realm (unsafeWindow) is what tells the truth about the top frame
@@ -521,14 +521,9 @@
   let lastFillAt = 0;
 
   function optionNodes() {
-    const sel = '[role="radio"],[role="checkbox"],input[type="radio"],input[type="checkbox"]';
-    const nodes = [];
-    for (const n of qAll(sel, true)) {
-      const box = n.closest('label,[role="radio"],[role="checkbox"],li') || n.parentElement || n;
-      const text = box === n ? (n.value || n.getAttribute("aria-label") || "") : (box.innerText || n.value || "");
-      nodes.push({ node: n, text: textOf(text) });
-    }
-    return nodes;
+    const out = [];
+    for (const [, opts] of allGroups()) for (const o of opts) out.push({ node: o.node, text: o.text });
+    return out;
   }
 
   function clickNode(n) {
@@ -666,7 +661,7 @@
       const parts = [];
       for (const sib of cur.children) {
         if (sib === el || sib.contains(el)) continue;
-        if (sib.querySelector("textarea,[contenteditable=true],[role=radio],input")) continue;
+        if (sib.querySelector("textarea,[contenteditable=true],[role=radio],input,button,a,[role=button],select")) continue;
         const t = cleanText(sib.innerText || sib.textContent || "");
         if (t.length > 3 && t.length < 1500) parts.push(t);
       }
@@ -691,40 +686,98 @@
     return "";
   }
 
+  // styled radios hide the real input (opacity 0, 1px, or display:none), so the node itself is
+  // never the visibility gate - the group container is.
+  const CHOICE_SEL = '[role="radio"],[role="checkbox"],[role="option"],input[type="radio"],input[type="checkbox"]';
+
+  function optionLabel(n) {
+    let box = null;
+    try { box = n.closest('label,[role="radio"],[role="checkbox"],[role="option"],li'); } catch {}
+    if (!box) box = n.parentElement || n;
+    const raw = (box.innerText || "") || n.getAttribute("aria-label") || n.value || "";
+    return cleanText(raw);
+  }
+
   function radioGroup(node) {
-    const g = node.closest('[role="radiogroup"],fieldset');
-    if (g) return g;
-    const name = node.getAttribute("name");
-    if (!name) return node.parentElement;
+    const name = node.getAttribute && node.getAttribute("name");
+    if (name) {
+      let cur = node.parentElement;
+      for (let d = 0; d < 6 && cur; d++) {
+        let same = [];
+        try { same = cur.querySelectorAll('input[name="' + CSS.escape(name) + '"]'); } catch {}
+        if (same.length >= 2) return cur;
+        cur = cur.parentElement;
+      }
+    }
+    // tightest ancestor holding two choices: works for role=radio rows and label-wrapped inputs
     let cur = node.parentElement;
     for (let d = 0; d < 6 && cur; d++) {
-      const same = cur.querySelectorAll('input[name="' + CSS.escape(name) + '"]');
+      let same = [];
+      try { same = cur.querySelectorAll(CHOICE_SEL); } catch {}
       if (same.length >= 2) return cur;
       cur = cur.parentElement;
     }
-    return node.parentElement;
+    let g = null;
+    try { g = node.closest('[role="radiogroup"],[role="group"],fieldset,ul,ol'); } catch {}
+    return g || node.parentElement;
+  }
+
+  function choiceGroups() {
+    const map = new Map();
+    for (const n of qAll(CHOICE_SEL, false)) {
+      try { if (n.closest('[aria-hidden="true"]')) continue; } catch {}
+      const g = radioGroup(n);
+      if (!g || !visible(g)) continue;
+      const text = optionLabel(n);
+      if (!text) continue;
+      let hit = n;
+      try { hit = n.closest("label") || n; } catch {}
+      if (!map.has(g)) map.set(g, []);
+      const arr = map.get(g);
+      if (arr.some((o) => o.text === text)) continue;
+      arr.push({ node: hit, text });
+    }
+    for (const [g, arr] of [...map]) if (arr.length < 2 || arr.length > 12) map.delete(g);
+    return map;
+  }
+
+  // no input at all: the choices are plain clickable rows, so group short-text siblings
+  function textGroups() {
+    const map = new Map();
+    const cands = qAll('label,li,[role="option"],[class*="answer"],[class*="choice"],[class*="option"]', true);
+    for (const el of cands) {
+      try { if (el.closest('[aria-hidden="true"]')) continue; } catch {}
+      if (el.querySelector("input,textarea,select,[contenteditable]")) continue;
+      if (el.querySelector("button,a")) continue;
+      const t = cleanText(el.innerText || "");
+      if (!t || t.length > 160) continue;
+      const p = el.parentElement;
+      if (!p || !visible(p)) continue;
+      const tags = String(p.className || "") + " " + (p.getAttribute("role") || "");
+      if (/nav|menu|tab|header|footer|breadcrumb|pagination|toolbar/i.test(tags)) continue;
+      if (!map.has(p)) map.set(p, []);
+      const arr = map.get(p);
+      if (arr.some((o) => o.text === t)) continue;
+      arr.push({ node: el, text: t });
+    }
+    for (const [p, arr] of [...map]) if (arr.length < 2 || arr.length > 12) map.delete(p);
+    return map;
+  }
+
+  function allGroups() {
+    const g = choiceGroups();
+    if (g.size) return g;
+    return textGroups();
   }
 
   function domItems() {
     const out = [];
     const seen = new Set();
-    const groups = new Map();
-    for (const n of qAll('[role="radio"],[role="checkbox"],input[type="radio"],input[type="checkbox"]', true)) {
-      const g = radioGroup(n);
-      if (!g) continue;
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(n);
-    }
-    for (const [g, nodes] of groups) {
-      if (nodes.length < 2) continue;
+    for (const [g, nodes] of allGroups()) {
       const options = [];
-      for (const n of nodes) {
-        const label = n.closest("label") || (n.id ? document.querySelector('label[for="' + CSS.escape(n.id) + '"]') : null);
-        const text = cleanText((label && label.innerText) || n.getAttribute("aria-label") || n.value || "");
-        if (text) options.push({ label: String(options.length), text });
-      }
+      for (const n of nodes) options.push({ label: String(options.length), text: n.text });
       if (options.length < 2) continue;
-      let stem = promptFor(g);
+      let stem = promptFor(g) || promptFor(nodes[0].node);
       if (!stem) {
         const anc = g.closest('[class*="question"],[class*="prompt"],[class*="item"],[class*="response"]');
         if (anc) {
@@ -751,6 +804,7 @@
     return out;
   }
 
+  let lastDiagAt = 0;
   function domScan() {
     let list = [];
     try { list = domItems(); } catch { return []; }
@@ -762,7 +816,28 @@
       fresh.push(it);
     }
     if (fresh.length) ingest(fresh, "dom://" + location.host);
+    else if (!domKeys.size && Date.now() - lastDiagAt > 12000) {
+      lastDiagAt = Date.now();
+      let groups = 0, choices = 0, boxes = 0;
+      try { const gs = allGroups(); groups = gs.size; for (const [, o] of gs) choices += o.length; } catch {}
+      try { boxes = openFields().length; } catch {}
+      log("scan: " + choices + " choice(s) in " + groups + " group(s), " + boxes + " write box(es), " + roots().length + " root(s)");
+    }
     return list;
+  }
+
+  function probeDom() {
+    const rootsLen = roots().length;
+    const gs = allGroups();
+    const out = [];
+    for (const [g, opts] of gs) {
+      out.push({
+        tag: g.tagName,
+        cls: String(g.className || "").slice(0, 80),
+        texts: opts.map((o) => o.text.slice(0, 40)),
+      });
+    }
+    return { roots: rootsLen, inputs: qAll(CHOICE_SEL, false).length, groups: out };
   }
 
   function fillLocal() {
@@ -1503,7 +1578,7 @@
   }
 
   try {
-    W.__answers = { version: VERSION, extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
+    W.__answers = { version: VERSION, extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, probeDom, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
   } catch {}
 
   log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)") + " · v" + VERSION);
