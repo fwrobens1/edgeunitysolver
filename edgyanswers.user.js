@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.4.3
+// @version      1.4.4
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -32,7 +32,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.3";
+  const VERSION = "1.4.4";
   const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   // in the tampermonkey sandbox window.top and window are different proxies, so comparing the
   // page realm (unsafeWindow) is what tells the truth about the top frame
@@ -597,7 +597,7 @@
           || nodes.find((x) => norm(x.text).includes(want) || want.includes(norm(x.text)));
         if (n) { clickNode(n.node); hit++; }
       }
-      if (hit) { lastFillAt = Date.now(); answered.set(itemKey(item), Date.now()); log("filled " + hit + " option(s)"); }
+      if (hit) { lastFillAt = Date.now(); answered.set(itemKey(item), Date.now()); try { busUp({ ea: "answered", key: itemKey(item) }); } catch {} log("filled " + hit + " option(s)"); }
       return hit > 0;
     }
     if (ans.text) {
@@ -607,6 +607,7 @@
       setFieldValue(fields[0], ans.text);
       lastFillAt = Date.now();
       answered.set(itemKey(item), Date.now());
+      try { busUp({ ea: "answered", key: itemKey(item) }); } catch {}
       log("filled text answer");
       return true;
     }
@@ -773,6 +774,30 @@
     return textGroups();
   }
 
+  // ground truth lives in the DOM, not in whichever realm clicked: the shell and the activity
+  // frame each hold their own state, and only the checked input tells both of them the same truth
+  function groupAnswered(nodes) {
+    for (const o of nodes) {
+      const n = o.node;
+      try {
+        if (n.matches && n.matches("input") && n.checked) return true;
+        if (n.querySelector && n.querySelector('input:checked')) return true;
+        const rc = n.closest && n.closest('[aria-checked="true"],[aria-selected="true"]');
+        if (rc) return true;
+        const cls = String((n.className && n.className.baseVal) || n.className || "");
+        if (/(^|[\s_-])(selected|checked|chosen|active|sel)([\s_-]|$)/i.test(cls)) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  function fieldFilled(f) {
+    try {
+      const v = f.isContentEditable ? f.innerText : f.value;
+      return String(v || "").trim().length > 0;
+    } catch { return false; }
+  }
+
   function domItems() {
     const out = [];
     const seen = new Set();
@@ -793,7 +818,7 @@
       const k = "mcq|" + norm(stem);
       if (seen.has(k)) continue;
       seen.add(k);
-      out.push({ ref: "", type: "mcq", stem, options: options.slice(0, 12) });
+      out.push({ ref: "", type: "mcq", stem, options: options.slice(0, 12), answered: groupAnswered(nodes) });
     }
     for (const f of openFields()) {
       if (f.tagName === "TEXTAREA" && fieldArea(f) < 3000) continue;
@@ -802,7 +827,7 @@
       const k = "open|" + norm(stem);
       if (seen.has(k)) continue;
       seen.add(k);
-      out.push({ ref: "", type: "open", stem, options: [] });
+      out.push({ ref: "", type: "open", stem, options: [], answered: fieldFilled(f) });
     }
     return out;
   }
@@ -1158,7 +1183,8 @@
     return "";
   }
 
-  // every question detected on this page must have had an answer applied before we move on
+  // every question detected on this page must be answered before we move on — checked in the DOM
+  // first, since the realm that clicked is not necessarily the realm that advances
   function pageState() {
     let list = [];
     try { list = domItems(); } catch {}
@@ -1168,14 +1194,14 @@
       const k = itemKey(it);
       if (seen.has(k)) continue;
       seen.add(k);
-      if (!answered.has(k)) missing.push(it);
+      if (!it.answered && !answered.has(k)) missing.push(it);
     }
     return { count: seen.size, missing, ready: seen.size > 0 && missing.length === 0 };
   }
 
   function advanceTick(force) {
     if (!force && !cfg.autonext) return;
-    if (Date.now() < advanceCooldown || (!force && advanceCount > 60)) return;
+    if (Date.now() < advanceCooldown || (!force && advanceCount > 300)) return;
     if (!IS_TOP && Date.now() - lastStateAt > 5000) {
       // tell the shell whether this frame still has a step of its own to take
       if (findButton(ADVANCE_RE, false, true)) { lastStateAt = Date.now(); busUp({ ea: "state", can: true }); }
@@ -1231,8 +1257,10 @@
     }
 
     const hasFrames = (() => { try { return window.frames.length > 0; } catch { return false; } })();
+    // let a child take its own step, but only briefly — a child that reports and then does
+    // nothing must not stall the shell
     const topGate = !force && IS_TOP && hasFrames &&
-      (Date.now() - lastChildState < 8000 || Date.now() - lastChildAdv < 8000);
+      (Date.now() - lastChildAdv < 8000 || Date.now() - lastChildState < 4000);
     if (!topGate) {
       const a = clickButton(ADVANCE_RE, false);
       if (a) {
@@ -1271,6 +1299,7 @@
       if (m.ea === "verdict") { ui.learned++; if (ui.renderSolve) ui.renderSolve(); }
       if (m.ea === "log" && m.msg) log("frame: " + m.msg);
       if (m.ea === "adv") { lastChildAdv = Date.now(); lastFillAt = Date.now(); }
+      if (m.ea === "answered" && m.key) answered.set(m.key, Date.now());
       if (m.ea === "state" && m.can) lastChildState = Date.now();
       if (m.ea === "refs?") {
         const t = referenceText(1200) || pageContext(1200);
@@ -1295,6 +1324,7 @@
       }
       if (m.ea === "refs?") busUp({ ea: "refs?" });
       if (m.ea === "adv") busUp({ ea: "adv", text: m.text });
+      if (m.ea === "answered" && m.key && !m.relay) busUp({ ea: "answered", key: m.key, relay: true });
       if (m.ea === "state" && m.can) busUp({ ea: "state", can: true });
       if (m.ea === "fill") fillLocal();
     });
