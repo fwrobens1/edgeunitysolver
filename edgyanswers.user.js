@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.3.2
+// @version      1.4.0
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -45,6 +45,7 @@
     key: "",
     sniff: true,
     words: 100,
+    autonext: false,
     pos: null,
     open: true,
     tab: "solve",
@@ -505,6 +506,8 @@
   // endregion
 
   // region fill
+  let lastFillAt = 0;
+
   function optionNodes() {
     const sel = '[role="radio"],[role="checkbox"],input[type="radio"],input[type="checkbox"]';
     const nodes = [];
@@ -585,7 +588,7 @@
           || nodes.find((x) => norm(x.text).includes(want) || want.includes(norm(x.text)));
         if (n) { clickNode(n.node); hit++; }
       }
-      if (hit) log("filled " + hit + " option(s)");
+      if (hit) { lastFillAt = Date.now(); log("filled " + hit + " option(s)"); }
       return hit > 0;
     }
     if (ans.text) {
@@ -593,6 +596,7 @@
       const fields = open.length ? open : textFields();
       if (!fields.length) return false;
       setFieldValue(fields[0], ans.text);
+      lastFillAt = Date.now();
       log("filled text answer");
       return true;
     }
@@ -996,6 +1000,88 @@
   }
   // endregion
 
+  // region advance
+  // auto next / submit: only fires after something was actually filled, so a page with no
+  // answer never gets skipped, and the top-level "next activity" waits for a child click.
+  const ADVANCE_RE = /^(next|next activity|next question|next page|submit|submit answer|submit assessment|submit activity|submit quiz|submit response|check answer|finish|finish activity|turn in|save and next|save & next)$/i;
+  const ENTER_RE = /^(start|start activity|begin|resume|continue|open|let'?s go)$/i;
+  const CONFIRM_RE = /^(yes|yes,? submit|ok|okay|confirm|submit|turn in|continue)$/i;
+  const AVOID_RE = /previous|back|exit|log ?out|tutor|help|settings|menu|cancel|discard|close|save and exit|review|print|flag/i;
+  let lastAdvanceAt = 0;
+  let lastChildAdv = 0;
+  let lastChildState = 0;
+  let lastStateAt = 0;
+  let advanceCooldown = 0;
+  let advanceCount = 0;
+  let lastClickText = "";
+  let lastClickAt = 0;
+
+  function buttonText(el) {
+    return String(el.innerText || el.value || el.textContent || el.getAttribute("aria-label") || el.title || "")
+      .replace(/\s+/g, " ").trim();
+  }
+
+  function findButton(re, modalOnly, skipDedupe) {
+    for (const el of qAll('button,a,[role="button"],input[type="submit"],input[type="button"]', true)) {
+      if (el.closest('[aria-hidden="true"]')) continue;
+      if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") continue;
+      const t = buttonText(el);
+      if (!t || t.length > 40 || AVOID_RE.test(t) || !re.test(t)) continue;
+      if (modalOnly && !el.closest('[role="dialog"],[role="alertdialog"],[class*="modal"],[class*="dialog"]')) continue;
+      if (!skipDedupe && t === lastClickText && Date.now() - lastClickAt < 6000) continue;
+      return el;
+    }
+    return null;
+  }
+
+  function clickButton(re, modalOnly) {
+    const el = findButton(re, modalOnly, false);
+    if (!el) return "";
+    const t = buttonText(el);
+    try { el.scrollIntoView({ block: "center" }); el.click(); } catch {}
+    lastClickText = t;
+    lastClickAt = Date.now();
+    return t;
+  }
+
+  function advanceTick(force) {
+    if (!force && !cfg.autonext) return;
+    if (Date.now() < advanceCooldown || (!force && advanceCount > 60)) return;
+    if (!IS_TOP && Date.now() - lastStateAt > 5000) {
+      // tell the shell whether this frame still has a step of its own to take
+      if (findButton(ADVANCE_RE, false, true)) { lastStateAt = Date.now(); busUp({ ea: "state", can: true }); }
+    }
+    if (Date.now() - lastAdvanceAt < 20000) {
+      const c = clickButton(CONFIRM_RE, true);
+      if (c) {
+        lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 1500; advanceCount++;
+        log("auto: " + c + " (dialog)");
+        return;
+      }
+    }
+    const filledRecently = force || Date.now() - lastFillAt < 120000;
+    const hasFrames = (() => { try { return window.frames.length > 0; } catch { return false; } })();
+    const topGate = !force && IS_TOP && hasFrames &&
+      (Date.now() - lastChildState < 8000 || Date.now() - lastChildAdv < 8000);
+    if (filledRecently && !topGate) {
+      const a = clickButton(ADVANCE_RE, false);
+      if (a) {
+        lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 2200; advanceCount++;
+        log("auto: " + a);
+        if (!IS_TOP) busUp({ ea: "adv", text: a });
+        return;
+      }
+    }
+    const e = clickButton(ENTER_RE, false);
+    if (e) {
+      lastAdvanceAt = Date.now(); advanceCooldown = Date.now() + 2500; advanceCount++;
+      log("auto: " + e);
+    }
+  }
+
+  setInterval(() => { if (!document.hidden) { try { advanceTick(false); } catch {} } }, 2000);
+  // endregion
+
   // region bus
   function busUp(msg) {
     try { window.parent.postMessage(msg, "*"); } catch {}
@@ -1012,6 +1098,8 @@
       if (m.ea === "item") { ui.items += m.n || 1; ui.last = m.stem || ""; if (ui.renderSolve) ui.renderSolve(); if (m.item) busDown({ ea: "last", item: m.item }); }
       if (m.ea === "verdict") { ui.learned++; if (ui.renderSolve) ui.renderSolve(); }
       if (m.ea === "log" && m.msg) log("frame: " + m.msg);
+      if (m.ea === "adv") { lastChildAdv = Date.now(); lastFillAt = Date.now(); }
+      if (m.ea === "state" && m.can) lastChildState = Date.now();
       if (m.ea === "refs?") {
         const t = referenceText(1200) || pageContext(1200);
         if (t) busDown({ ea: "refs", text: t });
@@ -1034,6 +1122,8 @@
         if (!m.relay) busDown(Object.assign({}, m, { relay: true }));
       }
       if (m.ea === "refs?") busUp({ ea: "refs?" });
+      if (m.ea === "adv") busUp({ ea: "adv", text: m.text });
+      if (m.ea === "state" && m.can) busUp({ ea: "state", can: true });
       if (m.ea === "fill") fillLocal();
     });
   }
@@ -1207,6 +1297,13 @@
     const aiBtn = mkBtn("use ai", () => { cfg.ai = !cfg.ai; saveCfg(); ui.renderSolve(); });
     const brnBtn = mkBtn("brainly", () => { cfg.brainly = !cfg.brainly; saveCfg(); ui.renderSolve(); });
     pane.solve.appendChild(h("div", { class: "row" }, autoBtn, aiBtn, brnBtn));
+    const nextBtn = mkBtn("auto next", () => {
+      cfg.autonext = !cfg.autonext;
+      saveCfg();
+      ui.renderSolve();
+      log("auto next " + (cfg.autonext ? "on — fills, submits, moves on" : "off"));
+    });
+    pane.solve.appendChild(h("div", { class: "row" }, nextBtn, mkBtn("next now", () => advanceTick(true), "go")));
 
     // settings pane
     const f = (label, key, opts) => {
@@ -1267,6 +1364,7 @@
       autoBtn.className = "btn " + (cfg.auto ? "go" : "off");
       aiBtn.className = "btn " + (cfg.ai ? "go" : "off");
       brnBtn.className = "btn " + (cfg.brainly ? "go" : "off");
+      nextBtn.className = "btn " + (cfg.autonext ? "go" : "off");
     };
     ui.renderLog = () => {
       const counts = new Map();
@@ -1368,7 +1466,7 @@
   }
 
   try {
-    W.__answers = { extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText };
+    W.__answers = { extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
   } catch {}
 
   log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)"));
