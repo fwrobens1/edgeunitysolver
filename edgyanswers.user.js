@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         answers — edgenuity / learnosity
 // @namespace    local.answers
-// @version      1.4.0
+// @version      1.4.1
 // @description  captures learnosity item traffic, caches correct answers, fills from cache or an ai endpoint, mobile + desktop panel, lockdown spoof
 // @match        *://*.edgenuity.com/*
 // @match        *://*.learnosity.com/*
@@ -32,8 +32,20 @@
 (function () {
   "use strict";
 
+  const VERSION = "1.4.1";
   const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-  const IS_TOP = (() => { try { return window.top === window; } catch { return false; } })();
+  // in the tampermonkey sandbox window.top and window are different proxies, so comparing the
+  // page realm (unsafeWindow) is what tells the truth about the top frame
+  const IS_TOP = (() => {
+    try {
+      if (!W.top) return true;
+      if (W.top === W.self || W.top === W) return true;
+      try { if (W.top.document === document) return true; } catch {}
+      return false; // page realm says we are framed
+    } catch {
+      try { return window.top === window; } catch { return false; }
+    }
+  })();
   const DEFAULTS = {
     auto: false,
     ai: false,
@@ -1130,7 +1142,7 @@
   // endregion
 
   // region ui
-  const ui = { items: 0, learned: 0, last: "", root: null, logEl: null, solveEl: null, host: null };
+  const ui = { items: 0, learned: 0, last: "", root: null, logEl: null, solveEl: null, host: null, setOpen: null };
 
   function h(tag, props, ...kids) {
     const el = document.createElement(tag);
@@ -1208,6 +1220,7 @@
     const host = document.createElement("div");
     host.style.cssText = "all:initial;position:fixed;inset:auto;z-index:2147483647";
     document.documentElement.appendChild(host);
+    ui.host = host;
     const root = host.attachShadow({ mode: "open" });
     const style = document.createElement("style");
     style.textContent = CSS;
@@ -1255,7 +1268,7 @@
       fab.classList.toggle("show", !v);
       if (v) {
         wrap.style.transform = "";
-        requestAnimationFrame(applyLayout);
+        try { requestAnimationFrame(applyLayout); } catch { applyLayout(); }
       }
     }
 
@@ -1444,14 +1457,14 @@
 
     root.appendChild(wrap);
     root.appendChild(fab);
-    ui.host = host;
+    ui.setOpen = setOpen;
 
     ui.renderSolve();
     ui.renderCfgButtons();
     setTab(cfg.tab || "solve");
     setOpen(cfg.open !== false);
     window.addEventListener("resize", applyLayout);
-    log("panel mounted on " + location.hostname);
+    log("panel mounted on " + location.hostname + " · v" + VERSION);
   }
   // endregion
 
@@ -1460,16 +1473,40 @@
   if (cfg.stealth) stealth(W);
 
   if (IS_TOP) {
-    const boot = () => { try { mount(); } catch (e) { log("mount failed: " + e.message); } };
+    const mountFail = (e) => {
+      log("mount failed: " + e.message);
+      try {
+        if (document.getElementById("ea-fail")) return;
+        const b = document.createElement("button");
+        b.id = "ea-fail";
+        b.textContent = "ea";
+        b.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:2147483647;width:48px;height:48px;border-radius:24px;background:#141414;color:#fff;border:1px solid #444;font:600 14px system-ui;cursor:pointer";
+        b.onclick = () => { try { b.remove(); mount(); } catch (err) { alert("answers: " + err.message); } };
+        (document.documentElement || document.body).appendChild(b);
+      } catch {}
+    };
+    const boot = () => { try { mount(); } catch (e) { mountFail(e); } };
+    const ensure = () => {
+      try {
+        if (!ui.host) { mount(); return; }
+        if (ui.host.isConnected) return;
+        // the player rewrites the document (document.open/write or a fresh html node) and drops the host
+        (document.documentElement || document.body).appendChild(ui.host);
+        log("panel re-attached after page rewrite");
+        if (ui.setOpen) ui.setOpen(cfg.open !== false);
+      } catch (e) { mountFail(e); }
+    };
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot, { once: true });
     else boot();
+    setInterval(ensure, 1500);
+    window.addEventListener("pageshow", ensure);
   }
 
   try {
-    W.__answers = { extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
+    W.__answers = { version: VERSION, extractItems, bankGet, bankPut, bankImport, bankExport, norm, sim, hash, cfg, saveCfg, probeAi, domItems, domScan, fillLocal, expandToggles, pageContext, referenceText, advanceTick };
   } catch {}
 
-  log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)"));
+  log("ready on " + location.hostname + (IS_TOP ? "" : " (frame)") + " · v" + VERSION);
   try {
     const p = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
     log("hooks " + (p && p.__ea ? "xhr ok" : "xhr MISSING") + " · sniff " + (cfg.sniff ? "on" : "off") + " · realm " + (W === window ? "page" : "isolated"));
